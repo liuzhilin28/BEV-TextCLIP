@@ -1,0 +1,26 @@
+# 屏蔽极其庞大的 PyCharm 安装包
+86e6698dbdca2_pycharm-professional-2022.1.4/
+.idea/
+
+# 屏蔽极其庞大的数据集和点云文件！绝对不能传！
+data/
+*.pcd
+*.tgz
+*.tar.gz
+*.zip
+
+# 屏蔽超大的模型权重文件
+*.pth
+*.pt
+*.safetensors
+*.bin
+models/clip/
+models/clip_random/
+
+# 屏蔽日志和缓存
+__pycache__/
+*.npy
+*.jar
+*.whl
+*.log
+logs/
