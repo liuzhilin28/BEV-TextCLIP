@@ -1,0 +1,54 @@
+# Waymo 数据集配置
+# Waymo 自动驾驶数据集配置
+# 数据集: https://waymo.com/open/
+
+dataset: waymo
+num_classes: 23
+
+# BEV 配置
+bev_resolution: [200, 200]
+bev_channels: 256
+num_depth_bins: 4
+
+# 图像编码器配置
+image_encoder_type: resnet50
+image_pretrained: true
+image_freeze: true
+
+# 点云编码器配置
+point_encoder_type: pointpillar
+voxel_size: [0.1, 0.1, 0.1]
+point_cloud_range: [-75.0, -75.0, -2.0, 75.0, 75.0, 4.0]
+
+# 文本编码器配置
+text_encoder_type: clip
+text_pretrained: true
+text_freeze: true
+
+# 融合配置
+fusion_type: cross_attention
+use_bidirectional_attention: true
+num_attention_heads: 8
+attention_dropout: 0.1
+
+# 对比学习配置
+use_contrastive: true
+contrastive_weight: 0.5
+temperature: 0.07
+use_memory_bank: false
+
+# 训练配置
+batch_size: 4
+learning_rate: 0.0001
+weight_decay: 0.01
+max_epochs: 100
+warmup_epochs: 5
+
+optimizer_type: adamw
+scheduler_type: cosine
+
+eval_interval: 5
+save_interval: 10
+
+# Waymo 特有配置
+waymo_version: 1.4.2
