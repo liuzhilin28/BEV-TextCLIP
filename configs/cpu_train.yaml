@@ -1,0 +1,46 @@
+# BEV-TextCLIP CPU Training Configuration
+# 针对 CPU 训练优化的配置文件
+#
+# 
+
+dataset: dummy
+num_classes: 16
+
+bev_resolution: [200, 200]
+bev_channels: 256
+num_depth_bins: 4
+
+image_encoder_type: resnet50
+image_pretrained: false
+image_freeze: false
+
+point_encoder_type: pointpillar
+voxel_size: [0.2, 0.2, 0.2]
+point_cloud_range: [-20, -20, -2, 20, 20, 6]
+
+text_encoder_type: clip
+text_pretrained: true
+text_freeze: true
+
+fusion_type: cross_attention
+use_bidirectional_attention: true
+num_attention_heads: 8
+attention_dropout: 0.1
+
+use_contrastive: true
+contrastive_weight: 0.5
+temperature: 0.07
+use_memory_bank: false
+
+# CPU Optimized Training Settings
+batch_size: 1
+learning_rate: 0.0001
+weight_decay: 0.01
+max_epochs: 5
+warmup_epochs: 1
+
+optimizer_type: adamw
+scheduler_type: cosine
+
+eval_interval: 1
+save_interval: 2
