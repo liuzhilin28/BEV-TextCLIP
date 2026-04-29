@@ -3,7 +3,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 # 改这里：优先读你单独保存的本次日志
-LOG_PATH = Path("train_full.log")
+LOG_PATH = Path("logs/train.log")
 OUT_DIR = Path("plots")
 OUT_DIR.mkdir(exist_ok=True)
 

@@ -7,6 +7,9 @@ import os
 import sys
 import gc
 from contextlib import nullcontext
+
+os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -15,7 +18,16 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 import logging
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+HF_HOME = os.environ.setdefault(
+    'HF_HOME',
+    os.path.join(REPO_ROOT, '.cache', 'huggingface'),
+)
+os.environ.setdefault('HF_HUB_CACHE', os.path.join(HF_HOME, 'hub'))
+os.environ.setdefault('HF_XET_CACHE', os.path.join(HF_HOME, 'xet'))
+os.environ.setdefault('TRANSFORMERS_CACHE', os.path.join(HF_HOME, 'transformers'))
+
+sys.path.insert(0, REPO_ROOT)
 
 from src.configs.bev_textclip_config import BEVTextCLIPConfig, get_config
 from src.models.bev_textclip import BEVTextCLIP, create_bev_textclip_model
@@ -345,7 +357,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_epochs', type=int, default=100)
     parser.add_argument('--learning_rate', type=float, default=5e-5)
-    parser.add_argument('--weight_decay', type=float, default=0.05)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--log_dir', type=str, default='logs')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
     parser.add_argument('--resume', type=str, default=None)
@@ -362,7 +374,10 @@ def main():
     logger.info(f'Device: {device}')
     logger.info(f'Args: {args}')
 
-    config = get_config('nuscenes')
+    if args.config and os.path.exists(args.config):
+        config = BEVTextCLIPConfig.from_yaml(args.config)
+    else:
+        config = get_config('nuscenes')
     config.batch_size = args.batch_size
     config.learning_rate = args.learning_rate
     config.weight_decay = args.weight_decay
@@ -376,7 +391,10 @@ def main():
     if config.text_encoder_type == 'local_clip':
         config.text_model_path = resolve_repo_path(repo_root, config.text_model_path)
 
-    logger.info(f'Config: num_classes={config.num_classes}, bev_resolution={config.bev_resolution}')
+    logger.info(
+        f'Config: num_classes={config.num_classes}, '
+        f'bev_resolution={config.bev_resolution}, fusion_type={config.fusion_type}'
+    )
     logger.info(
         f'Training: image_freeze={config.image_freeze}, '
         f'text_freeze={config.text_freeze}, amp={config.use_amp}, image_size={config.image_size}'
@@ -446,10 +464,17 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    scheduler = CosineAnnealingLR(
+    """scheduler = CosineAnnealingLR(
         optimizer,
         T_max=args.num_epochs,
         eta_min=1e-6,
+    )"""
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='max',  # 我们监控 mIoU，越大越好
+        factor=0.5,  # 表现不进步时学习率减半
+        patience=3,  # 忍受 3 个 epoch
     )
 
     start_epoch = 0
@@ -487,7 +512,7 @@ def main():
             use_amp=config.use_amp,
         )
 
-        scheduler.step()
+        scheduler.step(val_miou)
 
         if val_miou > best_val_miou:
             best_val_miou = val_miou

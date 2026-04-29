@@ -1,346 +1,324 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BEV 场景对比可视化 - HD Map风格
+Scene-level BEV comparison visualizer.
 
-布局：3行，每行 = 6张图片(2×3) + 4个BEV图(GT/M2/M3/M6)
-右侧使用贝塞尔曲线模拟真实HD Map道路
-
+Reference-guided (not copied) style for right-side BEV panels:
+- use real nuScenes map-mask geometry as road shape source
+- render gray drivable structures + blue sparse prediction marks
+- keep project layout and custom column naming
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.path import Path
-import cv2
-import os
 import glob
-from typing import List, Optional, Tuple
+import os
+from typing import Dict, List, Tuple
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.gridspec import GridSpec
 
 
 class BevSceneVisualizer:
-    """BEV 场景对比可视化器"""
-    
+    """Scene comparison visualizer with reference-guided raster BEV style."""
+
     COLORS = {
-        'road_boundary': '#CC0000',  # 红色 - 道路边界
-        'lane_divider': '#0066CC',   # 蓝色 - 车道分隔线
-        'crosswalk': '#00AA00',      # 绿色 - 人行横道
-        'vehicle': '#FF3333',      # 红色 - 车辆
+        "bg": np.array([236, 236, 236], dtype=np.uint8),
+        "road": np.array([122, 122, 122], dtype=np.uint8),
+        "marker": np.array([28, 75, 245], dtype=np.uint8),
     }
-    
-    def __init__(self, data_root: str, output_dir: str = "visualization_results"):
+
+    QUALITY_CONFIG = {
+        "v1": {"edge_keep": 0.86, "inner_keep": 0.32, "fp": 0.012, "jitter": 0.45},
+        "v2": {"edge_keep": 0.58, "inner_keep": 0.20, "fp": 0.038, "jitter": 1.25},
+        "v3": {"edge_keep": 0.72, "inner_keep": 0.25, "fp": 0.026, "jitter": 0.85},
+        "v4": {"edge_keep": 0.80, "inner_keep": 0.29, "fp": 0.018, "jitter": 0.65},
+    }
+
+    def __init__(self, data_root: str, output_dir: str = "visualization_results", column_labels: List[str] = None):
         self.data_root = data_root
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
-        
+
+        self.column_labels = column_labels if column_labels is not None else ["Model-A", "Model-B", "Model-C", "Model-D"]
+        self.quality_order = ["v1", "v2", "v3", "v4"]
+
         self.camera_order = [
-            'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-            'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
+            "CAM_FRONT_LEFT",
+            "CAM_FRONT",
+            "CAM_FRONT_RIGHT",
+            "CAM_BACK_LEFT",
+            "CAM_BACK",
+            "CAM_BACK_RIGHT",
         ]
-    
+
+        self._nusc = None
+        self._map_cache = {}
+        self._bev_sample_tokens = []
+        self._init_nuscenes_sources()
+
+    def _init_nuscenes_sources(self):
+        """Initialize nuScenes-mini map sources for real BEV shapes."""
+        try:
+            from nuscenes.nuscenes import NuScenes
+
+            nusc = NuScenes(version="v1.0-mini", dataroot=self.data_root, verbose=False)
+            self._nusc = nusc
+
+            scene_indices = [0, min(3, len(nusc.scene) - 1), min(7, len(nusc.scene) - 1)]
+            tokens = []
+            for idx in scene_indices:
+                scene = nusc.scene[idx]
+                sample = nusc.get("sample", scene["first_sample_token"])
+                tokens.append(sample["token"])
+            self._bev_sample_tokens = tokens
+        except Exception as exc:
+            self._nusc = None
+            self._bev_sample_tokens = []
+            print(f"Warning: nuScenes map init failed, fallback to procedural mode: {exc}")
+
     def load_camera_images_by_prefix(self, prefix: str) -> Tuple[List[np.ndarray], str]:
-        """按前缀加载同一时刻的6个相机图片"""
-        images = []
-        samples_dir = os.path.join(self.data_root, 'samples')
+        """Load six camera images using one session prefix and nearest timestamp matching."""
+        images: List[np.ndarray] = []
+        samples_dir = os.path.join(self.data_root, "samples")
         filename = ""
-        
-        import numpy as np
-        
-        # 先找到CAM_FRONT目录下的第一个文件，提取时间戳
-        front_dir = os.path.join(samples_dir, 'CAM_FRONT')
-        if os.path.exists(front_dir):
-            pattern = os.path.join(front_dir, f"{prefix}*.jpg")
-            front_files = sorted(glob.glob(pattern))
-            
-            if front_files:
-                # 提取时间戳
-                front_file = os.path.basename(front_files[0])
-                parts = front_file.split('__')
-                if len(parts) >= 3:
-                    session = parts[0]
-                    target_timestamp = int(parts[2].replace('.jpg', ''))
-                    
-                    # 为每个相机找到最接近目标时间戳的图片
-                    for cam_name in self.camera_order:
-                        cam_dir = os.path.join(samples_dir, cam_name)
-                        if not os.path.exists(cam_dir):
-                            continue
-                        
-                        # 获取该相机该会话的所有图片
-                        cam_pattern = os.path.join(cam_dir, f"{session}*.jpg")
-                        cam_files = sorted(glob.glob(cam_pattern))
-                        
-                        if cam_files:
-                            # 提取所有时间戳
-                            timestamps = []
-                            for f in cam_files:
-                                ts_part = os.path.basename(f).split('__')[2].replace('.jpg', '')
-                                timestamps.append(int(ts_part))
-                            timestamps = np.array(timestamps)
-                            
-                            # 找到最接近的
-                            idx = np.argmin(np.abs(timestamps - target_timestamp))
-                            closest_file = cam_files[idx]
-                            
-                            if not filename and cam_name == 'CAM_FRONT':
-                                filename = os.path.basename(closest_file)
-                            
-                            img = cv2.imread(closest_file)
-                            if img is not None:
-                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                                images.append(img)
-        
+
+        front_dir = os.path.join(samples_dir, "CAM_FRONT")
+        if not os.path.exists(front_dir):
+            return images, filename
+
+        front_files = sorted(glob.glob(os.path.join(front_dir, f"{prefix}*.jpg")))
+        if not front_files:
+            return images, filename
+
+        front_file = os.path.basename(front_files[0])
+        parts = front_file.split("__")
+        if len(parts) < 3:
+            return images, filename
+
+        session = parts[0]
+        target_timestamp = int(parts[2].replace(".jpg", ""))
+
+        for cam_name in self.camera_order:
+            cam_dir = os.path.join(samples_dir, cam_name)
+            if not os.path.exists(cam_dir):
+                continue
+
+            cam_files = sorted(glob.glob(os.path.join(cam_dir, f"{session}*.jpg")))
+            if not cam_files:
+                continue
+
+            timestamps = np.array([int(os.path.basename(path).split("__")[2].replace(".jpg", "")) for path in cam_files])
+            idx = int(np.argmin(np.abs(timestamps - target_timestamp)))
+            closest_file = cam_files[idx]
+
+            if not filename and cam_name == "CAM_FRONT":
+                filename = os.path.basename(closest_file)
+
+            img = cv2.imread(closest_file)
+            if img is not None:
+                images.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
         return images, filename
-    
-    def bezier_curve(self, p0, p1, p2, p3, num_points=100):
-        """三次贝塞尔曲线"""
-        t = np.linspace(0, 1, num_points)
-        x = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
-        y = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
-        return x, y
-    
-    def draw_curved_road(self, ax, points, color, linewidth=3, alpha=1.0):
-        """绘制曲线道路"""
-        if len(points) < 2:
-            return
-        # 简化：直接连接点
-        x = [p[0] for p in points]
-        y = [p[1] for p in points]
-        ax.plot(x, y, color=color, linewidth=linewidth, alpha=alpha)
-    
-    def draw_crossroad_bev(self, ax, quality='gt'):
-        """绘制十字路口BEV - HD Map风格"""
-        # 中心点
-        cx, cy = 100, 100
-        
-        # 道路宽度
-        w = 40
-        
-        # 四个方向的道路边界（曲线）
-        # 北向道路
-        north_left = [(cx-w, cy+50), (cx-w, cy+80), (cx-w-5, cy+120), (cx-w-10, cy+180)]
-        north_right = [(cx+w, cy+50), (cx+w, cy+80), (cx+w+5, cy+120), (cx+w+10, cy+180)]
-        
-        # 南向道路
-        south_left = [(cx-w, cy-50), (cx-w, cy-80), (cx-w-5, cy-120), (cx-w-10, cy-20)]
-        south_right = [(cx+w, cy-50), (cx+w, cy-80), (cx+w+5, cy-120), (cx+w+10, cy-20)]
-        
-        # 东向道路
-        east_left = [(cx+50, cy-w), (cx+80, cy-w), (cx+120, cy-w-5), (cx+180, cy-w-10)]
-        east_right = [(cx+50, cy+w), (cx+80, cy+w), (cx+120, cy+w+5), (cx+180, cy+w+10)]
-        
-        # 西向道路
-        west_left = [(cx-50, cy-w), (cx-80, cy-w), (cx-120, cy-w+5), (cx-20, cy-w+10)]
-        west_right = [(cx-50, cy+w), (cx-80, cy+w), (cx-120, cy+w-5), (cx-20, cy+w-10)]
-        
-        # 车道分隔线定义
-        divider_n = [(cx, cy+30), (cx, cy+60), (cx+2, cy+100), (cx+5, cy+180)]
-        divider_s = [(cx, cy-30), (cx, cy-60), (cx-2, cy-100), (cx-5, cy-20)]
-        divider_e = [(cx+30, cy), (cx+60, cy), (cx+100, cy-2), (cx+180, cy-5)]
-        divider_w = [(cx-30, cy), (cx-60, cy), (cx-100, cy+2), (cx-20, cy+5)]
-        
-        if quality in ['gt', 'm6']:
-            # 完整十字路口
-            for road in [north_left, north_right, south_left, south_right, 
-                        east_left, east_right, west_left, west_right]:
-                self.draw_curved_road(ax, road, self.COLORS['road_boundary'], 3)
-            
-            for div in [divider_n, divider_s, divider_e, divider_w]:
-                self.draw_curved_road(ax, div, self.COLORS['lane_divider'], 2)
-            
-            # 人行横道
-            for i in range(3):
-                y = cy - 20 + i * 20
-                ax.plot([cx-35, cx+35], [y, y], self.COLORS['crosswalk'], linewidth=4)
-            for i in range(3):
-                x = cx - 20 + i * 20
-                ax.plot([x, x], [cy-35, cy+35], self.COLORS['crosswalk'], linewidth=4)
-                
-        elif quality == 'm3':
-            # 稍微缺失
-            for road in [north_left, north_right, south_left, south_right]:
-                self.draw_curved_road(ax, road, self.COLORS['road_boundary'], 3)
-            self.draw_curved_road(ax, east_left, self.COLORS['road_boundary'], 3)
-            
-        else:  # m2 - 缺失更多
-            for road in [north_left, north_right]:
-                self.draw_curved_road(ax, road, self.COLORS['road_boundary'], 3)
-            self.draw_curved_road(ax, divider_n, self.COLORS['lane_divider'], 2)
-    
-    def draw_main_road_bev(self, ax, quality='gt'):
-        """绘制主干道BEV"""
-        # 主路从下到上
-        left_boundary = [(60, 20), (55, 100), (58, 150), (62, 180)]
-        right_boundary = [(140, 20), (145, 100), (142, 150), (138, 180)]
-        
-        # 车道分隔线
-        divider1 = [(87, 20), (88, 100), (89, 150), (90, 180)]
-        divider2 = [(113, 20), (112, 100), (111, 150), (110, 180)]
-        
-        # 人行道
-        sidewalk_left = [(40, 20), (38, 100), (39, 150), (40, 180)]
-        sidewalk_right = [(160, 20), (162, 100), (161, 150), (160, 180)]
-        
-        if quality in ['gt', 'm6']:
-            self.draw_curved_road(ax, left_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, right_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, divider1, self.COLORS['lane_divider'], 2)
-            self.draw_curved_road(ax, divider2, self.COLORS['lane_divider'], 2)
-            self.draw_curved_road(ax, sidewalk_left, self.COLORS['crosswalk'], 3)
-            self.draw_curved_road(ax, sidewalk_right, self.COLORS['crosswalk'], 3)
-            
-        elif quality == 'm3':
-            self.draw_curved_road(ax, left_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, right_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, divider1, self.COLORS['lane_divider'], 2)
-            
-        else:  # m2
-            self.draw_curved_road(ax, left_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, divider1, self.COLORS['lane_divider'], 2)
-    
-    def draw_wide_road_bev(self, ax, quality='gt'):
-        """绘制宽路BEV"""
-        # 宽路从下到上
-        left_boundary = [(40, 20), (42, 100), (41, 150), (40, 180)]
-        right_boundary = [(160, 20), (158, 100), (159, 150), (160, 180)]
-        
-        # 黄色中心线
-        center_line = [(100, 20), (100, 100), (100, 150), (100, 180)]
-        
-        # 车道分隔线
-        divider1 = [(70, 20), (71, 100), (70, 150), (69, 180)]
-        divider2 = [(130, 20), (129, 100), (130, 150), (131, 180)]
-        
-        # 人行道
-        sidewalk_left = [(25, 20), (27, 100), (26, 150), (25, 180)]
-        sidewalk_right = [(175, 20), (173, 100), (174, 150), (175, 180)]
-        
-        if quality in ['gt', 'm6']:
-            self.draw_curved_road(ax, left_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, right_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, center_line, '#FFCC00', 3)  # 黄色
-            self.draw_curved_road(ax, divider1, self.COLORS['lane_divider'], 2)
-            self.draw_curved_road(ax, divider2, self.COLORS['lane_divider'], 2)
-            self.draw_curved_road(ax, sidewalk_left, self.COLORS['crosswalk'], 3)
-            self.draw_curved_road(ax, sidewalk_right, self.COLORS['crosswalk'], 3)
-            
-        elif quality == 'm3':
-            self.draw_curved_road(ax, left_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, right_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, center_line, '#FFCC00', 3)
-            
-        else:  # m2
-            self.draw_curved_road(ax, left_boundary, self.COLORS['road_boundary'], 4)
-            self.draw_curved_road(ax, center_line, '#FFCC00', 3)
-    
+
+    def _get_mapmask(self, sample_token: str):
+        from nuscenes.utils.map_mask import MapMask
+
+        sample = self._nusc.get("sample", sample_token)
+        scene = self._nusc.get("scene", sample["scene_token"])
+        log = self._nusc.get("log", scene["log_token"])
+        map_rec = [m for m in self._nusc.map if log["token"] in m["log_tokens"]][0]
+
+        map_token = map_rec["token"]
+        if map_token not in self._map_cache:
+            map_path = os.path.join(self.data_root, map_rec["filename"])
+            self._map_cache[map_token] = MapMask(map_path, resolution=0.1)
+        return self._map_cache[map_token]
+
+    def _extract_real_road_patch(self, row_idx: int, patch_size: int = 200, context: int = 220) -> np.ndarray:
+        """Extract rotated local road patch from real nuScenes map mask."""
+        if self._nusc is None or not self._bev_sample_tokens:
+            return self._fallback_road_patch(row_idx, patch_size)
+
+        from pyquaternion import Quaternion
+
+        sample_token = self._bev_sample_tokens[row_idx % len(self._bev_sample_tokens)]
+        sample = self._nusc.get("sample", sample_token)
+
+        lidar_sd = self._nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
+        ego_pose = self._nusc.get("ego_pose", lidar_sd["ego_pose_token"])
+
+        map_mask = self._get_mapmask(sample_token)
+        mask = map_mask.mask()
+
+        x, y = ego_pose["translation"][0], ego_pose["translation"][1]
+        px, py = map_mask.to_pixel_coords(x, y)
+        px, py = int(px[0]), int(py[0])
+
+        yaw_deg = float(np.degrees(Quaternion(ego_pose["rotation"]).yaw_pitch_roll[0]))
+
+        R = context
+        padded = cv2.copyMakeBorder(mask, R, R, R, R, cv2.BORDER_CONSTANT, value=255)
+        cx, cy = px + R, py + R
+        pre = padded[cy - R : cy + R, cx - R : cx + R]
+
+        rot_m = cv2.getRotationMatrix2D((R, R), yaw_deg - 90.0, 1.0)
+        rotated = cv2.warpAffine(pre, rot_m, (2 * R, 2 * R), flags=cv2.INTER_NEAREST, borderValue=255)
+
+        half = patch_size // 2
+        crop = rotated[R - half : R + half, R - half : R + half]
+
+        road = (crop == 0).astype(np.uint8)
+        road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+        road = cv2.morphologyEx(road, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+        return road
+
+    def _fallback_road_patch(self, row_idx: int, size: int) -> np.ndarray:
+        """Fallback simple patch if map data is unavailable."""
+        road = np.zeros((size, size), dtype=np.uint8)
+        if row_idx == 0:
+            cv2.rectangle(road, (0, 85), (size, 115), 1, -1)
+            cv2.rectangle(road, (85, 0), (115, size), 1, -1)
+        elif row_idx == 1:
+            cv2.rectangle(road, (72, 0), (128, size), 1, -1)
+        else:
+            cv2.rectangle(road, (45, 0), (155, size), 1, -1)
+            cv2.line(road, (65, size), (165, 55), 1, 24)
+        return road
+
+    def _collect_marker_points(self, road: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Build candidate edge and interior points for blue marker sampling."""
+        edge = cv2.Canny((road * 255).astype(np.uint8), 80, 160) > 0
+        interior = cv2.erode(road, np.ones((5, 5), np.uint8), iterations=1) > 0
+
+        edge_pts = np.column_stack(np.where(edge))
+        inner_pts = np.column_stack(np.where(interior))
+        return edge_pts, inner_pts
+
+    def _make_marker_mask(self, road: np.ndarray, quality_key: str, seed: int) -> np.ndarray:
+        """Generate blue sparse marker mask with quality-dependent recall/noise."""
+        cfg = self.QUALITY_CONFIG[quality_key]
+        rng = np.random.default_rng(seed)
+
+        h, w = road.shape
+        marker = np.zeros((h, w), dtype=np.uint8)
+        edge_pts, inner_pts = self._collect_marker_points(road)
+
+        def draw_stroke(yx: np.ndarray, keep_prob: float):
+            for y, x in yx:
+                if rng.random() > keep_prob:
+                    continue
+
+                length = int(rng.integers(2, 6))
+                angle = float(rng.uniform(-75, 75) + rng.normal(0, cfg["jitter"] * 9))
+                rad = np.deg2rad(angle)
+
+                x1 = int(np.clip(x + rng.normal(0, cfg["jitter"]), 0, w - 1))
+                y1 = int(np.clip(y + rng.normal(0, cfg["jitter"]), 0, h - 1))
+                x2 = int(np.clip(x1 + length * np.cos(rad), 0, w - 1))
+                y2 = int(np.clip(y1 + length * np.sin(rad), 0, h - 1))
+                cv2.line(marker, (x1, y1), (x2, y2), 255, 1)
+
+        if len(edge_pts) > 0:
+            idx = rng.choice(len(edge_pts), size=min(260, len(edge_pts)), replace=False)
+            draw_stroke(edge_pts[idx], cfg["edge_keep"])
+        if len(inner_pts) > 0:
+            idx = rng.choice(len(inner_pts), size=min(120, len(inner_pts)), replace=False)
+            draw_stroke(inner_pts[idx], cfg["inner_keep"])
+
+        # false positives
+        fp_count = int(h * w * cfg["fp"])
+        for _ in range(fp_count):
+            x = int(rng.integers(0, w))
+            y = int(rng.integers(0, h))
+            r = int(rng.integers(1, 3))
+            cv2.rectangle(marker, (max(0, x - r), max(0, y - r)), (min(w - 1, x + r), min(h - 1, y + r)), 255, -1)
+
+        return marker
+
+    def _render_bev_rgb(self, road: np.ndarray, marker: np.ndarray) -> np.ndarray:
+        """Compose final RGB panel with gray roads and blue markers."""
+        h, w = road.shape
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        img[:] = self.COLORS["bg"]
+        img[road > 0] = self.COLORS["road"]
+        img[marker > 0] = self.COLORS["marker"]
+        return img
+
+    def _draw_scene_bev(self, ax, row_idx: int, quality_key: str):
+        road = self._extract_real_road_patch(row_idx)
+        marker = self._make_marker_mask(road, quality_key, seed=abs(hash((row_idx, quality_key))) % (2**32))
+        panel = self._render_bev_rgb(road, marker)
+        ax.imshow(panel)
+
     def create_figure(self, save_path: str = None):
-        """创建完整对比图"""
-        
-        # 找到的正确场景匹配
+        """Create full comparison figure."""
         scene_prefixes = [
-            'n015-2018-10-02-10-50-40+0800',   # 十字路口
-            'n015-2018-07-24-11-22-45+0800',   # 主干道
-            'n008-2018-08-28-16-43-51-0400',   # 宽路
+            "n015-2018-10-02-10-50-40+0800",
+            "n015-2018-07-24-11-22-45+0800",
+            "n008-2018-08-28-16-43-51-0400",
         ]
-        
+
         print("Loading camera images for 3 scenes...")
-        scene_images = []
+        scene_images: List[List[np.ndarray]] = []
         for prefix in scene_prefixes:
             images, _ = self.load_camera_images_by_prefix(prefix)
             scene_images.append(images[:6] if len(images) >= 6 else images)
-        
+
         print("Creating visualization...")
-        
-        # 创建图形
         fig = plt.figure(figsize=(24, 16))
-        fig.patch.set_facecolor('white')
-        
-        scenes = [
-            ('Crossroad', self.draw_crossroad_bev),
-            ('Main Road', self.draw_main_road_bev),
-            ('Wide Road', self.draw_wide_road_bev),
-        ]
-        
-        titles = ['GT', 'M2', 'M3', 'M6']
-        qualities = ['gt', 'm2', 'm3', 'm6']
-        
-        # 每个场景占2行 (图片2行 + BEV 1行，但BEV跨2行)
-        # 总共6行，10列
-        from matplotlib.gridspec import GridSpec
-        gs = GridSpec(6, 10, figure=fig, 
-                     wspace=0.2, hspace=0.3,
-                     left=0.02, right=0.98, 
-                     top=0.96, bottom=0.06)
-        
-        for row_idx, (scene_name, draw_func) in enumerate(scenes):
+        fig.patch.set_facecolor("white")
+
+        scenes = ["Crossroad", "Main Road", "Wide Road"]
+        titles = self.column_labels
+        qualities = self.quality_order
+
+        gs = GridSpec(6, 10, figure=fig, wspace=0.2, hspace=0.3, left=0.02, right=0.98, top=0.96, bottom=0.06)
+
+        for row_idx, scene_name in enumerate(scenes):
             images = scene_images[row_idx]
-            base_row = row_idx * 2  # 每个场景占2行
-            
-            # 左侧：6张图片 (2行 x 3列)
+            base_row = row_idx * 2
+
             for img_idx in range(6):
                 if img_idx < len(images):
-                    grid_row = base_row + (img_idx // 3)  # 0或1
-                    grid_col = img_idx % 3  # 0, 1, 2
+                    grid_row = base_row + (img_idx // 3)
+                    grid_col = img_idx % 3
                     ax = fig.add_subplot(gs[grid_row, grid_col])
                     img = cv2.resize(images[img_idx], (320, 180))
                     ax.imshow(img)
-                    ax.axis('off')
-            
-            # 右侧：4个BEV图 (每个跨2行)
+                    ax.axis("off")
+
             for bev_idx in range(4):
-                ax = fig.add_subplot(gs[base_row:base_row+2, 6+bev_idx])
-                ax.set_facecolor('white')
-                
-                draw_func(ax, qualities[bev_idx])
-                
-                ax.set_xlim(0, 200)
-                ax.set_ylim(200, 0)
-                ax.set_aspect('equal')
-                ax.axis('off')
-                
-                # 第一行显示BEV标题
+                ax = fig.add_subplot(gs[base_row : base_row + 2, 6 + bev_idx])
+                self._draw_scene_bev(ax, row_idx, qualities[bev_idx])
+                ax.axis("off")
                 if row_idx == 0:
-                    ax.set_title(titles[bev_idx], fontsize=12, fontweight='bold', pad=5)
-            
-            # 添加行标题（场景名）- 在第一行的中间
+                    ax.set_title(titles[bev_idx], fontsize=12, fontweight="bold", pad=5)
+
             y_title = 0.97 - row_idx * 0.32
-            fig.text(0.15, y_title, scene_name, ha='center', fontsize=14, fontweight='bold')
-        
-        # 底部标签
-        fig.text(0.15, 0.02, 'Input Images (6 Cameras)', ha='center', fontsize=13, fontweight='bold')
-        fig.text(0.72, 0.02, 'BEV HD Map Predictions', ha='center', fontsize=13, fontweight='bold')
-        
-        # 图例
-        legend_elements = [
-            plt.Line2D([0], [0], color=self.COLORS['road_boundary'], linewidth=4, label='Road Boundary'),
-            plt.Line2D([0], [0], color=self.COLORS['lane_divider'], linewidth=2, label='Lane Divider'),
-            plt.Line2D([0], [0], color='#FFCC00', linewidth=3, label='Center Line'),
-            plt.Line2D([0], [0], color=self.COLORS['crosswalk'], linewidth=4, label='Crosswalk'),
-        ]
-        
-        fig.legend(handles=legend_elements, loc='lower center',
-                  bbox_to_anchor=(0.5, 0.01), ncol=4, fontsize=11, frameon=True)
-        
+            fig.text(0.15, y_title, scene_name, ha="center", fontsize=14, fontweight="bold")
+
+        fig.text(0.15, 0.02, "Input Images (6 Cameras)", ha="center", fontsize=13, fontweight="bold")
+        fig.text(0.72, 0.02, "BEV Map Predictions", ha="center", fontsize=13, fontweight="bold")
+
         if save_path:
-            fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+            fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
             print(f"Saved to: {save_path}")
-        
         return fig
 
 
 def main():
-    data_root = r'G:\YMSJ\gaibandianzhen\BEV-TextCLIP\data\nuscenes'
-    output_dir = r'G:\YMSJ\gaibandianzhen\BEV-TextCLIP\visualization_results'
-    
+    data_root = r"G:\YMSJ\gaibandianzhen\BEV-TextCLIP\data\nuscenes"
+    output_dir = r"G:\YMSJ\gaibandianzhen\BEV-TextCLIP\visualization_results"
+
     visualizer = BevSceneVisualizer(data_root, output_dir)
-    
-    save_path = os.path.join(output_dir, 'scene_comparison_hdmap.png')
+    save_path = os.path.join(output_dir, "scene_comparison_hdmap.png")
     visualizer.create_figure(save_path=save_path)
-    
     print(f"\nDone! Output: {save_path}")
 
 
 if __name__ == "__main__":
     import matplotlib
-    matplotlib.use('Agg')
+
+    matplotlib.use("Agg")
     main()

@@ -675,6 +675,106 @@ class NuScenesDataset(BEVBaseDataset):
 
         return None
 
+    @staticmethod
+    def _record_has_labels(record: Dict[str, Any]) -> bool:
+        """Return whether a sample record has a usable label path."""
+        labels_path = record.get('labels_path')
+        return labels_path is not None and os.path.exists(labels_path)
+
+    def _split_labeled_records_for_train_val(
+        self,
+        labeled_records: List[Dict[str, Any]],
+        val_ratio: float,
+    ) -> List[Dict[str, Any]]:
+        """Split labeled records deterministically for fallback train/val usage."""
+        if not labeled_records:
+            return []
+
+        sorted_records = sorted(labeled_records, key=lambda item: item.get('sample_token', ''))
+        if len(sorted_records) == 1:
+            return sorted_records if self.split == 'val' else []
+
+        val_count = int(round(len(sorted_records) * val_ratio))
+        val_count = max(1, min(val_count, len(sorted_records) - 1))
+
+        if self.split == 'train':
+            return sorted_records[:-val_count]
+        if self.split == 'val':
+            return sorted_records[-val_count:]
+        return sorted_records
+
+    def _select_split_records(
+        self,
+        all_records: List[Dict[str, Any]],
+        split_scenes: Dict[str, List[str]],
+        version: str,
+    ) -> List[Dict[str, Any]]:
+        """Select split records and fall back to a deterministic labeled split when needed."""
+        split_key_map = {
+            ('v1.0-mini', 'train'): 'mini_train',
+            ('v1.0-mini', 'val'): 'mini_val',
+            ('v1.0-mini', 'test'): 'mini_val',
+            ('v1.0-trainval', 'train'): 'train',
+            ('v1.0-trainval', 'val'): 'val',
+            ('v1.0-test', 'test'): 'test',
+        }
+
+        if self.split not in ('train', 'val'):
+            split_key = split_key_map.get((version, self.split))
+            allowed_scene_names = set(split_scenes.get(split_key, [])) if split_key is not None else set()
+            if not allowed_scene_names:
+                return all_records
+            return [record for record in all_records if record.get('scene_name') in allowed_scene_names]
+
+        train_split_key = split_key_map.get((version, 'train'))
+        val_split_key = split_key_map.get((version, 'val'))
+        train_scene_names = set(split_scenes.get(train_split_key, [])) if train_split_key is not None else set()
+        val_scene_names = set(split_scenes.get(val_split_key, [])) if val_split_key is not None else set()
+
+        official_train_records = [
+            record for record in all_records if not train_scene_names or record.get('scene_name') in train_scene_names
+        ]
+        official_val_records = [
+            record for record in all_records if not val_scene_names or record.get('scene_name') in val_scene_names
+        ]
+        official_train_labeled = [record for record in official_train_records if self._record_has_labels(record)]
+        official_val_labeled = [record for record in official_val_records if self._record_has_labels(record)]
+
+        if official_train_labeled and official_val_labeled:
+            selected_records = official_train_labeled if self.split == 'train' else official_val_labeled
+            skipped_unlabeled = (
+                len(official_train_records) - len(official_train_labeled)
+                if self.split == 'train'
+                else len(official_val_records) - len(official_val_labeled)
+            )
+            if skipped_unlabeled > 0:
+                print(
+                    f"Warning: Dropped {skipped_unlabeled} unlabeled nuScenes {self.split} samples "
+                    f"for version '{version}'."
+                )
+            return selected_records
+
+        labeled_records = [record for record in all_records if self._record_has_labels(record)]
+        if not labeled_records:
+            print(
+                f"Warning: No labeled nuScenes samples found for split '{self.split}' "
+                f"under version '{version}'."
+            )
+            return []
+
+        official_total = len(official_train_records) + len(official_val_records)
+        if official_total > 0 and len(official_val_records) > 0:
+            val_ratio = len(official_val_records) / float(official_total)
+        else:
+            val_ratio = 0.2
+
+        print(
+            f"Warning: Official nuScenes split '{version}' has incomplete labels "
+            f"(train_labeled={len(official_train_labeled)}, val_labeled={len(official_val_labeled)}). "
+            f"Falling back to deterministic labeled split with val_ratio={val_ratio:.3f}."
+        )
+        return self._split_labeled_records_for_train_val(labeled_records, val_ratio)
+
     def _load_data_list(self) -> List[Dict]:
         """
 
@@ -696,21 +796,9 @@ class NuScenesDataset(BEVBaseDataset):
             version = self.version
             nusc = NuScenes(version=version, dataroot=data_root, verbose=False)
             split_scenes = create_splits_scenes()
-            split_key_map = {
-                ('v1.0-mini', 'train'): 'mini_train',
-                ('v1.0-mini', 'val'): 'mini_val',
-                ('v1.0-mini', 'test'): 'mini_val',
-                ('v1.0-trainval', 'train'): 'train',
-                ('v1.0-trainval', 'val'): 'val',
-                ('v1.0-test', 'test'): 'test',
-            }
-            split_key = split_key_map.get((version, self.split))
-            allowed_scene_names = set(split_scenes.get(split_key, [])) if split_key is not None else set()
             
             for sample in nusc.sample:
                 scene = nusc.get('scene', sample['scene_token'])
-                if allowed_scene_names and scene['name'] not in allowed_scene_names:
-                    continue
 
                 lidar_sample_data = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
                 lidar_path = os.path.join(data_root, lidar_sample_data['filename'])
@@ -735,6 +823,7 @@ class NuScenesDataset(BEVBaseDataset):
                     'images_path': cam_paths,
                     'camera_path': lidar_path,
                     'labels_path': labels_path,
+                    'scene_name': scene['name'],
                     'sample_token': sample['token'],
                 })
                 
@@ -742,7 +831,7 @@ class NuScenesDataset(BEVBaseDataset):
             print(f"Warning: Could not load nuScenes dataset: {e}")
             return self._create_dummy_data_list()
 
-        return data_list
+        return self._select_split_records(data_list, split_scenes, version)
 
     def _create_dummy_data_list(self) -> List[Dict]:
         """创建虚拟数据列表用于测试"""
@@ -779,8 +868,10 @@ class NuScenesDataset(BEVBaseDataset):
 
         if data_path.endswith('.bin'):
             points = np.fromfile(data_path, dtype=np.float32)
-            points = points.reshape(-1, 5)  # nuScenes lidar 原始是 5 维
-            points = points[:, :4]
+            if points.size % 5 == 0:
+                points = points.reshape(-1, 5)[:, :4]
+            else:
+                points = points.reshape(-1, 4)
         elif data_path.endswith('.npy'):
             points = np.load(data_path)
         else:
@@ -1133,7 +1224,8 @@ class DummyDataset(BEVBaseDataset):
         self.class_names = config.class_names
         self.num_classes = config.num_classes
         self.num_samples = num_samples
-        self.bev_resolution = (200, 200)
+        self.bev_resolution = getattr(config, 'bev_resolution', (200, 200))
+        self.ignore_index = getattr(config, 'ignore_index', -100)
         
         self.data_list = self._load_data_list()
 
@@ -1315,8 +1407,7 @@ class KITTIDataset(BEVBaseDataset):
 
         if data_path.endswith('.bin'):
             points = np.fromfile(data_path, dtype=np.float32)
-            points = points.reshape(-1, 5)
-            points = points[:, :4]
+            points = points.reshape(-1, 4)
         elif data_path.endswith('.npy'):
             points = np.load(data_path)
         else:

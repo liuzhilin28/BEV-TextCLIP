@@ -196,6 +196,7 @@ class CLIPTextEncoder(nn.Module):
         model_name: str = "openai/clip-vit-base-patch32",
         output_dim: int = 512,
         freeze: bool = True,
+        local_files_only: Optional[bool] = None,
     ):
         """
 
@@ -209,8 +210,21 @@ class CLIPTextEncoder(nn.Module):
         """
         super().__init__()
 
-        self.model = CLIPModel.from_pretrained(model_name)
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
+        if local_files_only is None:
+            local_files_only = (
+                os.environ.get('HF_HUB_OFFLINE') == '1' or
+                os.environ.get('TRANSFORMERS_OFFLINE') == '1'
+            )
+
+        self.model = CLIPModel.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+            use_safetensors=False,
+        )
+        self.tokenizer = CLIPTokenizer.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+        )
         self.transformer = self.model.text_model
         self.ln_final = self.model.text_model.final_layer_norm
         self.text_projection = self.model.text_projection
@@ -457,6 +471,7 @@ class TextEncoder(nn.Module):
                 model_name=model_name,
                 output_dim=output_dim,
                 freeze=freeze,
+                local_files_only=kwargs.get('local_files_only', None),
             )
         elif encoder_type == "custom":
             self.encoder = CustomTextEncoder(

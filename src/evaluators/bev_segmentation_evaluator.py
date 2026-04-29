@@ -34,7 +34,7 @@ class BEVSegmentationEvaluator(BaseEvaluator):
         num_classes: int,
         metric_list: Optional[List[str]] = None,
         class_names: Optional[List[str]] = None,
-        ignore_index: int = 255,
+        ignore_index: int = -100,
         device: str = 'cpu',
     ):
         """
@@ -132,7 +132,7 @@ class BEVSegmentationEvaluator(BaseEvaluator):
                     metrics['class_IoU'][name] = class_iou[i].item()
 
         if 'mIoU' in self.metric_list:
-            metrics['mIoU'] = class_iou.mean().item()
+            metrics['mIoU'] = class_iou[valid_classes].mean().item() if valid_classes.any() else 0.0
 
         if 'Accuracy' in self.metric_list:
             metrics['Accuracy'] = intersection.sum().item() / (cm.sum() + 1e-10)

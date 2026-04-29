@@ -88,6 +88,16 @@ class BEVTextCLIP(nn.Module):
         self.point_cloud_range = point_cloud_range
         self.text_encoder_type = text_encoder_type
 
+        if fusion_type == "gated_cross_attention":
+            num_bev_tokens = int(bev_resolution[0]) * int(bev_resolution[1])
+            if num_bev_tokens > 4096:
+                raise ValueError(
+                    "fusion_type='gated_cross_attention' builds full BEV-to-BEV attention "
+                    f"over {num_bev_tokens} tokens. This is too memory-intensive for "
+                    "the current implementation. Use fusion_type='gated_attention' or "
+                    "reduce bev_resolution."
+                )
+
         if text_pretrained is None:
             text_pretrained = pretrained
         self.text_pretrained = text_pretrained
@@ -157,9 +167,11 @@ class BEVTextCLIP(nn.Module):
             nn.Conv2d(bev_channels, bev_channels, 3, padding=1),
             nn.BatchNorm2d(bev_channels),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.3),  # 随机失活 30% 的特征，强制模型学习泛化特征
             nn.Conv2d(bev_channels, bev_channels, 3, padding=1),
             nn.BatchNorm2d(bev_channels),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.3),
             nn.Conv2d(bev_channels, num_classes, 1),
         )
 

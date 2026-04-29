@@ -19,8 +19,14 @@ models/clip_random/
 
 # 屏蔽日志和缓存
 __pycache__/
+.cache/
+.deps/
+.codex/
+.codex
 *.npy
 *.jar
 *.whl
 *.log
 logs/
+results/
+visualization_results/

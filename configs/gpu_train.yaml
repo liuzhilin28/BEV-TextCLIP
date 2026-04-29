@@ -21,7 +21,7 @@ text_encoder_type: clip
 text_pretrained: true
 text_freeze: true
 
-fusion_type: cross_attention
+fusion_type: gated_attention
 use_bidirectional_attention: true
 num_attention_heads: 8
 attention_dropout: 0.1
